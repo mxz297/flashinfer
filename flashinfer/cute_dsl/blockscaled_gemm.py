@@ -63,17 +63,56 @@ from typing import Callable, List
 sizeof_i32 = 4
 
 
-@dsl_user_op
-def with_byte(obj: Uint64, index: Int32, value: Uint8, *, loc=None, ip=None) -> Uint64:
-    obj &= ~(0xFF << (index * 8))
-    obj |= value << (index * 8)
-    assert isinstance(obj, Uint64), f"{obj=}"
+class DSMPendingPackedType:
+    def __init__(self, i1, i2, i3, i4):
+        self.data = [i1, i2, i3, i4]
+
+    def __extract_mlir_values__(self):
+        return [x.__extract_mlir_values__() for x in self.data]
+
+    def __new_from_mlir_values__(self, values):
+        return DSMPendingPackedType(
+            values[0][0], values[1][0], values[2][0], values[3][0]
+        )
+
+
+@cute.jit
+def with_byte(
+    obj: DSMPendingPackedType, index: Int32, value: Uint8, *, loc=None, ip=None
+) -> DSMPendingPackedType:
+    if index < 8:
+        obj.data[0] &= ~(0xFF << (index * 8))
+        obj.data[0] |= value << (index * 8)
+    elif index < 16:
+        index -= 8
+        obj.data[1] &= ~(0xFF << (index * 8))
+        obj.data[1] |= value << (index * 8)
+    elif index < 24:
+        index -= 16
+        obj.data[2] &= ~(0xFF << (index * 8))
+        obj.data[2] |= value << (index * 8)
+    else:
+        index -= 24
+        obj.data[3] &= ~(0xFF << (index * 8))
+        obj.data[3] |= value << (index * 8)
     return obj
 
 
-@dsl_user_op
-def read_byte(obj: Uint64, index: Int32, *, loc=None, ip=None) -> Uint8:
-    return ((obj >> (index * 8)) & 0xFF).to(Uint8)
+@cute.jit
+def read_byte(obj: DSMPendingPackedType, index: Int32, *, loc=None, ip=None) -> Uint8:
+    val = Uint8(0)
+    if index < 8:
+        val = ((obj.data[0] >> (index * 8)) & 0xFF).to(Uint8)
+    elif index < 16:
+        index -= 8
+        val = ((obj.data[1] >> (index * 8)) & 0xFF).to(Uint8)
+    elif index < 24:
+        index -= 16
+        val = ((obj.data[2] >> (index * 8)) & 0xFF).to(Uint8)
+    else:
+        index -= 24
+        val = ((obj.data[3] >> (index * 8)) & 0xFF).to(Uint8)
+    return val
 
 
 @dsl_user_op
@@ -1648,8 +1687,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             if cutlass.const_expr(tile_sched_params.dst_signals is not None):
                 assert self.num_c_stage < 256, "must be representable in 1 byte"
                 num_experts = tile_sched_params.masked_m.shape[0]
-                assert num_experts <= 8, "need to be packable into a u64"
-            dsm_pending_packed = Uint64(0)
+                assert num_experts <= 32, "need to be packable into four u64"
+            dsm_pending_packed = DSMPendingPackedType(
+                Uint64(0), Uint64(0), Uint64(0), Uint64(0)
+            )
             dsm_pending_idx = Int32(0)
             dsm_counter = Uint8(0)
 
