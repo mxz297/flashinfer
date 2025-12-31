@@ -61,6 +61,74 @@ from typing import Callable, List
 
 
 sizeof_i32 = 4
+sizeof_i64 = 8
+
+
+@dsl_user_op
+def read_globaltimer(*, loc=None, ip=None) -> Int64:
+    """Read the GPU global timer (nanoseconds on Hopper/Blackwell).
+
+    Uses inline PTX: mov.u64 $0, %globaltimer;
+
+    Note: %globaltimer is available on sm70+ and returns nanoseconds on recent
+    NVIDIA architectures (Hopper/Blackwell). Unlike clock/clock64, globaltimer
+    is synchronized across all SMs, making it suitable for comparing timings
+    across different blocks.
+
+    Returns:
+        Int64: Current global timer value in nanoseconds.
+    """
+    result = llvm.inline_asm(
+        T.i64(),
+        [],
+        "mov.u64 $0, %globaltimer;",
+        "=l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def _store_i64(ptr: Int64, val: Int64, *, loc=None, ip=None) -> None:
+    """Store an int64 value to a global memory address.
+
+    Uses inline PTX st.global.u64 instruction.
+    """
+    llvm.inline_asm(
+        None,
+        [ptr.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+        "st.global.u64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _load_i64(ptr: Int64, *, loc=None, ip=None) -> Int64:
+    """Load an int64 value from a global memory address.
+
+    Uses inline PTX ld.global.u64 instruction.
+    """
+    result = llvm.inline_asm(
+        T.i64(),
+        [ptr.ir_value(loc=loc, ip=ip)],
+        "ld.global.u64 $0, [$1];",
+        "=l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
 
 
 class DSMPendingPackedType:
@@ -141,6 +209,8 @@ class MaskedSchedulerParams:
         c: cute.Tensor,
         c_tiler: Tuple[int, int],
         cluster_shape_mnk: cute.Shape,
+        fi_prof_buf1_ptr: Optional[cute.Pointer],
+        fi_prof_buf2_ptr: Optional[cute.Pointer],
         *,
         loc=None,
         ip=None,
@@ -158,6 +228,8 @@ class MaskedSchedulerParams:
         # cluster_shape_mnk is kept for reconstruction
         self._cluster_shape_mnk = cluster_shape_mnk
         self.cluster_shape_mn = cluster_shape_mnk[:2]
+        self.fi_prof_buf1_ptr = fi_prof_buf1_ptr
+        self.fi_prof_buf2_ptr = fi_prof_buf2_ptr
         self._loc = loc
 
         self.problem_layout_ncluster_mnl = cute.make_layout(
@@ -176,6 +248,8 @@ class MaskedSchedulerParams:
             self.c,
             self.c_tiler,
             self._cluster_shape_mnk,
+            self.fi_prof_buf1_ptr,
+            self.fi_prof_buf2_ptr,
         ]:
             obj_values = extract_mlir_values(obj)
             values += obj_values
@@ -191,6 +265,8 @@ class MaskedSchedulerParams:
                 self.c,
                 self.c_tiler,
                 self._cluster_shape_mnk,
+                self.fi_prof_buf1_ptr,
+                self.fi_prof_buf2_ptr,
             ],
             self._values_pos,
             strict=True,
@@ -206,6 +282,41 @@ class MaskedSchedulerParams:
         num_persistent_clusters = max_active_clusters
 
         return (*self.cluster_shape_mn, num_persistent_clusters)
+
+
+@cute.jit
+def _collect_loop_profiling_data(
+    batch_id: Int32,
+    sm_id: Int32,
+    tile_sched_params: MaskedSchedulerParams,
+) -> None:
+    if cutlass.const_expr(
+        tile_sched_params.fi_prof_buf1_ptr is not None
+        and tile_sched_params.fi_prof_buf2_ptr is not None
+    ):
+        t = read_globaltimer()
+        _, _, num_sms = cute.arch.grid_dim()
+        base2 = tile_sched_params.fi_prof_buf2_ptr.toint()
+        _store_i64(base2 + sizeof_i64 * ((batch_id + 1) * num_sms + sm_id), t)
+
+        if sm_id + 1 == num_sms:
+            prev_t = _load_i64(base2 + sizeof_i64 * (batch_id * num_sms + sm_id))
+
+            base1 = tile_sched_params.fi_prof_buf1_ptr.toint()
+            acc_time = _load_i64(base1 + sizeof_i64 * batch_id)
+            acc_time += t - prev_t
+            _store_i64(base1 + sizeof_i64 * batch_id, acc_time)
+
+
+@dsl_user_op
+def _collect_entry_profiling_data(
+    tile_sched_params: MaskedSchedulerParams, *, loc=None, ip=None
+) -> None:
+    t = read_globaltimer()
+    bidx, bidy, bidz = cute.arch.block_idx()
+    _, _, num_sms = cute.arch.grid_dim()
+    base = tile_sched_params.fi_prof_buf2_ptr.toint()
+    _store_i64(base + sizeof_i64 * bidz, t)
 
 
 class MaskedScheduler:
@@ -757,6 +868,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         masked_m_tensor: cute.Tensor,
         dst_signals: Optional[cute.Pointer],
         alpha_tensor: Optional[cute.Tensor],
+        fi_prof_buf1_ptr: Optional[cute.Pointer],
+        fi_prof_buf2_ptr: Optional[cute.Pointer],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -921,6 +1034,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             masked_m_tensor,  # add masked layout
             dst_signals,
             c_tensor,
+            fi_prof_buf1_ptr,
+            fi_prof_buf2_ptr,
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
             max_active_clusters,
@@ -1072,6 +1187,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(
+            tile_sched_params.dst_signals is not None
+            and tile_sched_params.fi_prof_buf1_ptr is not None
+            and tile_sched_params.fi_prof_buf2_ptr is not None
+        ):
+            if warp_idx == self.epilog_warp_id[0] and tidx % 32 == 0:
+                _collect_entry_profiling_data(tile_sched_params)
 
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
@@ -1822,10 +1944,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                 read_byte(dsm_pending_packed, dsm_pending_idx)
                                 == dsm_counter
                             ):
-                                atomic_add_release_global(
+                                val = atomic_add_release_global(
                                     tile_sched_params.dst_signals.toint()
                                     + sizeof_i32 * dsm_pending_idx,
                                     value=1,
+                                )
+                                _collect_loop_profiling_data(
+                                    dsm_pending_idx, val, tile_sched_params
                                 )
                                 dsm_pending_idx += 1
 
@@ -1881,10 +2006,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 lane_id = tidx % 32
                 if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
                     while dsm_pending_idx < num_experts:
-                        atomic_add_release_global(
+                        val = atomic_add_release_global(
                             tile_sched_params.dst_signals.toint()
                             + sizeof_i32 * dsm_pending_idx,
                             value=1,
+                        )
+                        _collect_loop_profiling_data(
+                            dsm_pending_idx, val, tile_sched_params
                         )
                         dsm_pending_idx += 1
 
@@ -2203,6 +2331,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         masked_m_tensor: cute.Tensor,
         dst_signals: Optional[cute.Pointer],
         c: cute.Tensor,
+        fi_prof_buf1_ptr: Optional[cute.Pointer],
+        fi_prof_buf2_ptr: Optional[cute.Pointer],
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
@@ -2227,7 +2357,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = MaskedSchedulerParams(
-            masked_m_tensor, dst_signals, c, c_tiler, cluster_shape_mnl
+            masked_m_tensor,
+            dst_signals,
+            c,
+            c_tiler,
+            cluster_shape_mnl,
+            fi_prof_buf1_ptr,
+            fi_prof_buf2_ptr,
         )
         grid = MaskedScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
@@ -2673,6 +2809,8 @@ class MaskedBatchedMatmulCuteDSL:
         masked_m_ptr: cute.Pointer,
         dst_signals_ptr: Optional[cute.Pointer],
         alpha_ptr: cute.Pointer,
+        fi_prof_buf1_ptr: cute.Pointer,
+        fi_prof_buf2_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
     ):
         a_tensor = cute.make_tensor(
@@ -2769,6 +2907,8 @@ class MaskedBatchedMatmulCuteDSL:
             masked_m_tensor,
             dst_signals_ptr,
             alpha_tensor,
+            fi_prof_buf1_ptr,
+            fi_prof_buf2_ptr,
             self._max_active_clusters,
             current_stream,
         )
@@ -2807,10 +2947,13 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
-            ) = [16 for _ in range(8)]
-
+                fi_prof_buf1_data_ptr,
+                fi_prof_buf2_data_ptr,
+            ) = [16 for _ in range(10)]
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
+                fi_prof_buf1_data_ptr = None
+                fi_prof_buf2_data_ptr = None
 
         else:
             (
@@ -2822,6 +2965,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_tensor_gpu,
                 dst_signals_tensor_gpu,
                 alpha_tensor_gpu,
+                fi_prof_buf1,
+                fi_prof_buf2,
             ) = input_tensors
 
             assert enable_dst_signals == (dst_signals_tensor_gpu is not None)
@@ -2835,6 +2980,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
+                fi_prof_buf1_data_ptr,
+                fi_prof_buf2_data_ptr,
             ) = (
                 a_tensor_gpu.data_ptr(),
                 b_tensor_gpu.data_ptr(),
@@ -2846,6 +2993,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 if dst_signals_tensor_gpu is not None
                 else None,
                 alpha_tensor_gpu.data_ptr() if alpha_tensor_gpu is not None else None,
+                fi_prof_buf1.data_ptr() if fi_prof_buf1 is not None else None,
+                fi_prof_buf2.data_ptr() if fi_prof_buf2 is not None else None,
             )
 
         a_ptr = make_ptr(
@@ -2904,7 +3053,26 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             if alpha_data_ptr is not None and alpha_dtype is not None
             else None
         )
-
+        fi_prof_buf1_ptr = (
+            make_ptr(
+                cutlass.Int64,
+                fi_prof_buf1_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if fi_prof_buf1_data_ptr is not None
+            else None
+        )
+        fi_prof_buf2_ptr = (
+            make_ptr(
+                cutlass.Int64,
+                fi_prof_buf2_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if fi_prof_buf2_data_ptr is not None
+            else None
+        )
         return [
             a_ptr,
             b_ptr,
@@ -2914,6 +3082,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             masked_m_ptr,
             dst_signals_ptr,
             alpha_ptr,
+            fi_prof_buf1_ptr,
+            fi_prof_buf2_ptr,
         ]
 
     kernel = cute.compile(
@@ -2948,6 +3118,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         dst_signals_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
+        fi_prof_buf1=None,
+        fi_prof_buf2=None,
     ):
         if c_tensor_gpu is None:
             # fp4 gemm output is not supported
@@ -2972,6 +3144,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     masked_m_tensor_gpu,
                     dst_signals_tensor_gpu,
                     alpha_tensor_gpu,
+                    fi_prof_buf1,
+                    fi_prof_buf2,
                 ]
             ),
             current_stream,
@@ -2994,6 +3168,8 @@ def grouped_gemm_nt_masked(
     sf_vec_size: int,
     dst_signals: Optional[torch.Tensor] = None,
     sm_count: Optional[int] = None,
+    fi_prof_buf1=None,
+    fi_prof_buf2=None,
     **kwargs,
 ):
     """
@@ -3083,4 +3259,6 @@ def grouped_gemm_nt_masked(
         masked_m_tensor_gpu=masked_m,
         dst_signals_tensor_gpu=dst_signals,
         alpha_tensor_gpu=alpha,
+        fi_prof_buf1=fi_prof_buf1,
+        fi_prof_buf2=fi_prof_buf2,
     )
