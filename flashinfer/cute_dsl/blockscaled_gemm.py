@@ -148,20 +148,21 @@ class DSMPendingPackedType:
 def with_byte(
     obj: DSMPendingPackedType, index: Int32, value: Uint8, *, loc=None, ip=None
 ) -> DSMPendingPackedType:
+    value = value.to(Uint64)
     if index < 8:
-        obj.data[0] &= ~(0xFF << (index * 8))
+        obj.data[0] &= ~(Uint64(0xFF) << (index * 8))
         obj.data[0] |= value << (index * 8)
     elif index < 16:
         index -= 8
-        obj.data[1] &= ~(0xFF << (index * 8))
+        obj.data[1] &= ~(Uint64(0xFF) << (index * 8))
         obj.data[1] |= value << (index * 8)
     elif index < 24:
         index -= 16
-        obj.data[2] &= ~(0xFF << (index * 8))
+        obj.data[2] &= ~(Uint64(0xFF) << (index * 8))
         obj.data[2] |= value << (index * 8)
     else:
         index -= 24
-        obj.data[3] &= ~(0xFF << (index * 8))
+        obj.data[3] &= ~(Uint64(0xFF) << (index * 8))
         obj.data[3] |= value << (index * 8)
     return obj
 
@@ -289,6 +290,7 @@ def _collect_loop_profiling_data(
     batch_id: Int32,
     sm_id: Int32,
     tile_sched_params: MaskedSchedulerParams,
+    location: Int32,
 ) -> None:
     if cutlass.const_expr(
         tile_sched_params.fi_prof_buf1_ptr is not None
@@ -296,11 +298,17 @@ def _collect_loop_profiling_data(
     ):
         t = read_globaltimer()
         _, _, num_sms = cute.arch.grid_dim()
+        bidx, bidy, bidz = cute.arch.block_idx()
         base2 = tile_sched_params.fi_prof_buf2_ptr.toint()
-        _store_i64(base2 + sizeof_i64 * ((batch_id + 1) * num_sms + sm_id), t)
+        _store_i64(base2 + 2 * sizeof_i64 * ((batch_id + 1) * num_sms + sm_id), t)
+        val = (location << 16) + bidz
+        _store_i64(
+            base2 + 2 * sizeof_i64 * ((batch_id + 1) * num_sms + sm_id) + sizeof_i64,
+            val.to(Int64),
+        )
 
         if sm_id + 1 == num_sms:
-            prev_t = _load_i64(base2 + sizeof_i64 * (batch_id * num_sms + sm_id))
+            prev_t = _load_i64(base2 + 2 * sizeof_i64 * (batch_id * num_sms + sm_id))
 
             base1 = tile_sched_params.fi_prof_buf1_ptr.toint()
             acc_time = _load_i64(base1 + sizeof_i64 * batch_id)
@@ -316,7 +324,8 @@ def _collect_entry_profiling_data(
     bidx, bidy, bidz = cute.arch.block_idx()
     _, _, num_sms = cute.arch.grid_dim()
     base = tile_sched_params.fi_prof_buf2_ptr.toint()
-    _store_i64(base + sizeof_i64 * bidz, t)
+    _store_i64(base + 2 * sizeof_i64 * bidz, t)
+    _store_i64(base + 2 * sizeof_i64 * bidz + sizeof_i64, bidz.to(Int64))
 
 
 class MaskedScheduler:
@@ -459,6 +468,11 @@ class MaskedScheduler:
                 (dsm_pending_packed is not None)
                 and (self.params.dst_signals is not None)
             ):
+                _, _, bidz = cute.arch.block_idx()
+                warp_idx = cute.arch.warp_idx()
+                warp_idx = cute.arch.make_warp_uniform(warp_idx)
+                tidx, _, _ = cute.arch.thread_idx()
+
                 dsm_pending_packed = with_byte(
                     dsm_pending_packed,
                     index=batch_idx,
@@ -523,9 +537,19 @@ class MaskedScheduler:
         )
 
     @dsl_user_op
-    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
-        tile_info, _ = self.get_current_work(loc=loc, ip=ip)
-        return tile_info
+    def initial_work_tile_info(
+        self,
+        dsm_pending_packed: Optional[Uint64] = None,
+        dsm_counter: Optional[Uint8] = None,
+        num_c_stage: Optional[int] = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> WorkTileInfo:
+        tile_info, dsm_pending_packed = self.get_current_work(
+            dsm_pending_packed, dsm_counter, num_c_stage, loc=loc, ip=ip
+        )
+        return tile_info, dsm_pending_packed
 
     @dsl_user_op
     def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
@@ -1425,7 +1449,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tile_sched = MaskedScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            work_tile = tile_sched.initial_work_tile_info()
+            work_tile, _ = tile_sched.initial_work_tile_info()
 
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
@@ -1596,7 +1620,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tile_sched = MaskedScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
-            work_tile = tile_sched.initial_work_tile_info()
+            work_tile, _ = tile_sched.initial_work_tile_info()
 
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
@@ -1783,14 +1807,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
             )
 
-            #
-            # Persistent tile scheduling loop
-            #
-            tile_sched = MaskedScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
@@ -1815,6 +1831,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
             dsm_pending_idx = Int32(0)
             dsm_counter = Uint8(0)
+
+            #
+            # Persistent tile scheduling loop
+            #
+            tile_sched = MaskedScheduler.create(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+            work_tile, dsm_pending_packed = tile_sched.initial_work_tile_info(
+                dsm_pending_packed=dsm_pending_packed,
+                dsm_counter=dsm_counter,
+                num_c_stage=self.num_c_stage,
+            )
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
@@ -1911,10 +1939,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             tile_sched_params.dst_signals is not None
                         ):
                             dsm_counter = (dsm_counter + 1).to(Uint8)
-                            will_write_signals = (
-                                read_byte(dsm_pending_packed, dsm_pending_idx)
-                                == dsm_counter
-                            )
+                            val = read_byte(dsm_pending_packed, dsm_pending_idx)
+                            will_write_signals = val == dsm_counter
 
                             if will_write_signals:
                                 # The original c_pipeline.producer_acquire()
@@ -1950,7 +1976,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                     value=1,
                                 )
                                 _collect_loop_profiling_data(
-                                    dsm_pending_idx, val, tile_sched_params
+                                    dsm_pending_idx, val, tile_sched_params, 0
                                 )
                                 dsm_pending_idx += 1
 
@@ -2012,7 +2038,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             value=1,
                         )
                         _collect_loop_profiling_data(
-                            dsm_pending_idx, val, tile_sched_params
+                            dsm_pending_idx, val, tile_sched_params, 1
                         )
                         dsm_pending_idx += 1
 
@@ -2933,6 +2959,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     sm_count: int,
     sm_version: str,
     enable_dst_signals: bool,
+    enable_dst_signals_profiling: bool,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2952,6 +2979,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             ) = [16 for _ in range(10)]
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
+            if not enable_dst_signals_profiling:
                 fi_prof_buf1_data_ptr = None
                 fi_prof_buf2_data_ptr = None
 
@@ -3250,6 +3278,8 @@ def grouped_gemm_nt_masked(
         sm_count=sm_count,
         sm_version=f"sm_{major}{minor}",
         enable_dst_signals=dst_signals is not None,
+        enable_dst_signals_profiling=fi_prof_buf1 is not None
+        and fi_prof_buf2 is not None,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
