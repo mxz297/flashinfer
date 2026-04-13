@@ -183,6 +183,11 @@ constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 constexpr int CVT_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12090)
+constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 16;
+#else
+constexpr int CVT_FP16_TO_FP4_ELTS_PER_THREAD = 8;
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization Kernels
@@ -195,17 +200,21 @@ __launch_bounds__(512, 4) quantize_with_block_size(
 #else
 quantize_with_block_size(
 #endif
-    int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
-    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout) {
+    int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols,
+    Type const* __restrict__ in, float const* __restrict__ SFScale, uint32_t* __restrict__ out,
+    uint32_t* __restrict__ SFout, QuantizationSFLayout layout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
   // The elements per thread.
   static constexpr int ELTS_PER_THREAD = quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
                                              ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
-                                             : CVT_ELTS_PER_THREAD;
+                                             : quantization_type == BlockScaleQuantizationType::FP16_TO_FP4
+                                                   ? CVT_FP16_TO_FP4_ELTS_PER_THREAD
+                                                   : CVT_ELTS_PER_THREAD;
 
   using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
-  static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2 or 4
+  using FP4OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+  static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
   static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
   // Get the global scaling factor, which will be applied to the SF.
@@ -234,6 +243,61 @@ quantize_with_block_size(
   int numColThreads = numCols / ELTS_PER_THREAD;
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
+
+  if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4 &&
+                !USE_ROW_WISE_SCALE && !USE_INVERSE_SCALE) {
+    if (layout == QuantizationSFLayout::LINEAR && numbatches == 1 && numPaddedCols == numCols) {
+      int32_t const colIdx = threadIdx.x;
+      if (colIdx < numColThreads) {
+        int32_t const numSfCols = numCols / SF_VEC_SIZE;
+        auto const* inVec = reinterpret_cast<PackedVecT const*>(in);
+        auto* outVec = reinterpret_cast<FP4OutT*>(out);
+        auto* sfOut = reinterpret_cast<uint8_t*>(SFout);
+
+        for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
+          int64_t offset = static_cast<int64_t>(rowIdx) * numColThreads + colIdx;
+          uint8_t* sf_out = nullptr;
+          if (colIdx % CVT_NUM_THREADS_PER_SF == 0) {
+            int64_t sfOffset =
+                static_cast<int64_t>(rowIdx) * numSfCols + colIdx / CVT_NUM_THREADS_PER_SF;
+            sf_out = sfOut + sfOffset;
+          }
+
+          PackedVecT in_vec;
+          loadPackedVec(in_vec, inVec + offset);
+          outVec[offset] = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+              in_vec, SFScaleVal, sf_out);
+        }
+      }
+      return;
+    }
+
+    if (layout == QuantizationSFLayout::SWIZZLED_128x4 && numbatches == 1 &&
+        numPaddedCols == numCols && numPaddedRowsForSf == numRows) {
+      int32_t const colIdx = threadIdx.x;
+      if (colIdx < numColThreads) {
+        auto const* inVec = reinterpret_cast<PackedVecT const*>(in);
+        auto* outVec = reinterpret_cast<FP4OutT*>(out);
+
+        for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
+          int64_t offset = static_cast<int64_t>(rowIdx) * numColThreads + colIdx;
+          uint8_t* sf_out = nullptr;
+          if (colIdx % CVT_NUM_THREADS_PER_SF == 0) {
+            int64_t sfOffset = get_sf_out_offset_128x4(
+                std::nullopt, rowIdx, colIdx / CVT_NUM_THREADS_PER_SF,
+                std::optional<int>(numRows), numCols / SF_VEC_SIZE);
+            sf_out = reinterpret_cast<uint8_t*>(SFout) + sfOffset;
+          }
+
+          PackedVecT in_vec;
+          loadPackedVec(in_vec, inVec + offset);
+          outVec[offset] = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+              in_vec, SFScaleVal, sf_out);
+        }
+      }
+      return;
+    }
+  }
 
   asm volatile("griddepcontrol.wait;");
 
@@ -297,7 +361,7 @@ quantize_with_block_size(
           if (colIdx >= numColThreads && colIdx < numPaddedColThreads) {
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-              reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
+              reinterpret_cast<FP4OutT*>(out)[outOffset] = FP4OutT{0};
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ||
                                  quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
               reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
@@ -312,11 +376,12 @@ quantize_with_block_size(
             }
           } else {
             // Load the input vector.
-            PackedVecT in_vec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
+            PackedVecT in_vec;
+            loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
 
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-              reinterpret_cast<uint32_t*>(out)[outOffset] =
+              reinterpret_cast<FP4OutT*>(out)[outOffset] =
                   cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
                       in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {

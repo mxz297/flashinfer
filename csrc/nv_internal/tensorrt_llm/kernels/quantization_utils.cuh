@@ -285,38 +285,43 @@ struct PackedVec<__nv_fp8_e4m3, NUM_ELTS> {
                 "Vector size should match the number of elements per thread.");
 };
 
+struct alignas(32) PackedU32x8 {
+  uint32_t d[8];
+};
+
+template <typename VecT>
+__device__ __forceinline__ void loadPackedVec(VecT& val, VecT const* ptr) {
+  static_assert(sizeof(VecT) == 16 || sizeof(VecT) == 32,
+                "Packed vector loads expect 16-byte or 32-byte vectors.");
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(CUDA_VERSION) && \
+    (CUDA_VERSION >= 12090)
+  if constexpr (sizeof(VecT) == 32) {
+    auto& raw = reinterpret_cast<PackedU32x8&>(val);
+    asm volatile(
+        "ld.global.cg.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
+        : "=r"(raw.d[0]), "=r"(raw.d[1]), "=r"(raw.d[2]), "=r"(raw.d[3]),
+          "=r"(raw.d[4]), "=r"(raw.d[5]), "=r"(raw.d[6]), "=r"(raw.d[7])
+        : "l"(ptr));
+  } else
+#endif
+  {
+    val = *ptr;
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Quantization helper functions
 
 // Quantizes the provided PackedVec into the uint32_t or uint64_t output
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
-__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
-    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>
+cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal,
+                                  float reciprocalSFScaleVal, float vecMax, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
-
-  // Get absolute maximum values among the local 8 values.
-  auto localMax = cuda_abs(vec.elts[0]);
-
-// Local maximum value.
-#pragma unroll
-  for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
-  }
-
-  constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
-  // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-  if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  }
-  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
-  }
-  // Get the final absolute maximum values.
-  float vecMax = float(cuda_max(localMax.x, localMax.y));
 
   // 8 bits representation of the SF.
   uint8_t fp8SFVal;
@@ -340,11 +345,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
-    // Get the output scale.
-    // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
-    outputScale = vecMax != 0
-                      ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                      : 0.0f;
+    outputScale =
+        vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
   }
 
   if (SFout) {
@@ -371,6 +373,38 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 
   // Write the e2m1 values to global memory.
   return e2m1Vec;
+#else
+  return 0;
+#endif
+}
+
+template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
+                "CVT_ELTS_PER_THREAD must be 8 or 16");
+
+  auto localMax = cuda_abs(vec.elts[0]);
+
+#pragma unroll
+  for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++) {
+    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+  }
+
+  constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
+  static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2 ||
+                    CVT_NUM_THREADS_PER_SF == 4,
+                "FP16 to FP4 conversion expects 1, 2, or 4 threads per scale.");
+  if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+  }
+  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+  }
+  float vecMax = float(cuda_max(localMax.x, localMax.y));
+  return cvt_warp_fp16_to_fp4_with_vec_max<Type, SF_VEC_SIZE, CVT_ELTS_PER_THREAD, UE8M0_SF>(
+      vec, SFScaleVal, reciprocal_approximate_ftz(SFScaleVal), vecMax, SFout);
 #else
   return 0;
 #endif

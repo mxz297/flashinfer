@@ -67,7 +67,9 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
     globalScalePtr = static_cast<float*>(globalScale.value().data_ptr());
   }
 
-  const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  ffi::CUDADeviceGuard device_guard(self.device().device_id);
+  const int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  const cudaStream_t stream = get_stream(self.device());
 
   auto layout = tensorrt_llm::QuantizationSFLayout::LINEAR;
   layout = isSfSwizzledLayout ? (isSf8x4Layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4
@@ -79,7 +81,7 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
       1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      enable_pdl, useRowWiseGlobalScale, isGlobalScaleInversed, get_stream(self.device()));
+      enable_pdl, useRowWiseGlobalScale, isGlobalScaleInversed, stream);
 
   if (sfUseUE8M0) {
     if (self.dtype() == dl_float16) {
@@ -163,7 +165,9 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
   std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
   outputShape[rank - 1] = k / 2;
 
-  const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  ffi::CUDADeviceGuard device_guard(self.device().device_id);
+  const int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  const cudaStream_t stream = get_stream(self.device());
   auto layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4;
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
@@ -172,7 +176,7 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
       /*enable_pdl=*/false, use_row_wise_global_scale, /* inverse_scale */ false,                  \
-      get_stream(self.device()));
+      stream);
 
   if (self.dtype() == dl_float16) {
     LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
@@ -307,7 +311,6 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
       TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Invalid sfLayout value: " << sfLayout_;
       break;
   }
-  const cudaStream_t stream = get_stream(input.device());
   const float scale_inv = static_cast<float>(scale_inv_);
   auto const in_dtype = input.dtype();
 
@@ -322,6 +325,8 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
     expanded_idx_to_permuted_idx_ptr =
         reinterpret_cast<int32_t*>(expanded_idx_to_permuted_idx.value().data_ptr());
   }
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  const cudaStream_t stream = get_stream(input.device());
   if (in_dtype == dl_float16) {
     tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<half>(
         m, n, reinterpret_cast<half const*>(input.data_ptr()), scale_inv,

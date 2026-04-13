@@ -89,6 +89,15 @@ inline int computeEffectiveRows(int m, QuantizationSFLayout layout) {
   return effectiveRows;
 }
 
+inline int runtimeBlocksPerSM(int blockThreads) {
+  int device = -1;
+  cudaGetDevice(&device);
+  int maxThreadsPerSM = 1024;
+  cudaDeviceGetAttribute(&maxThreadsPerSM, cudaDevAttrMaxThreadsPerMultiProcessor, device);
+  int blocks = (blockThreads > 0) ? (maxThreadsPerSM / blockThreads) : 1;
+  return std::max(1, blocks);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Quantization
 
@@ -103,8 +112,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   // Grid, Block size.
   // Each thread converts 8 values.
   dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
-  // Get number of blocks per SM (assume we can fully utilize the SM).
-  int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+  int const numBlocksPerSM = runtimeBlocksPerSM(static_cast<int>(block.x));
   int effectiveRows = computeEffectiveRows(m, layout);
   dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
@@ -295,6 +303,365 @@ template void invokeRowWiseAmax<__nv_fp8_e4m3>(uint32_t m, uint32_t n, __nv_fp8_
                                                cudaStream_t stream);
 #endif
 
+template <typename T, int NUM_ELTS>
+__device__ __forceinline__ float packedVecAmax(PackedVec<T, NUM_ELTS> const& vec) {
+  auto localMax = cuda_abs(vec.elts[0]);
+#pragma unroll
+  for (int i = 1; i < NUM_ELTS / 2; ++i) {
+    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
+  }
+  return static_cast<float>(cuda_max(localMax.x, localMax.y));
+}
+
+template <QuantizationSFLayout LAYOUT>
+__device__ __forceinline__ int64_t getPerTokenSwizzledRowBaseOffset(uint32_t rowIdx,
+                                                                    uint32_t numSfVecsPerRow) {
+  uint32_t const numKTiles = (numSfVecsPerRow + 3) >> 2;
+  if constexpr (LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
+    return static_cast<int64_t>(rowIdx >> 7) * static_cast<int64_t>(numKTiles) * 512 +
+        static_cast<int64_t>(rowIdx & 31) * 16 + static_cast<int64_t>((rowIdx & 127) >> 5) * 4;
+  } else {
+    static_assert(LAYOUT == QuantizationSFLayout::SWIZZLED_8x4);
+    return static_cast<int64_t>(rowIdx >> 3) * static_cast<int64_t>(numKTiles) * 32 +
+        static_cast<int64_t>(rowIdx & 7) * 4;
+  }
+}
+
+template <QuantizationSFLayout LAYOUT>
+__device__ __forceinline__ int64_t getPerTokenSwizzledSfOffset(int64_t rowBaseOffset,
+                                                               uint32_t sfVecIdx) {
+  if constexpr (LAYOUT == QuantizationSFLayout::SWIZZLED_128x4) {
+    return rowBaseOffset + static_cast<int64_t>(sfVecIdx >> 2) * 512 + (sfVecIdx & 3);
+  } else {
+    static_assert(LAYOUT == QuantizationSFLayout::SWIZZLED_8x4);
+    return rowBaseOffset + static_cast<int64_t>(sfVecIdx >> 2) * 32 + (sfVecIdx & 3);
+  }
+}
+
+template <typename T, uint32_t BLOCK_SIZE, bool FULL_TILE = false>
+__global__ void nvfp4QuantAndPerTokenScaleLinearKernel(
+    uint32_t m, uint32_t n, T const* __restrict__ input, float globalScaleInv,
+    uint8_t* __restrict__ weightOutput, uint8_t* __restrict__ scaleOutput,
+    float* __restrict__ perTokenScaleOutput) {
+  static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+  static constexpr int SF_VEC_SIZE = 16;
+  static constexpr int THREADS_PER_SCALE = SF_VEC_SIZE / ELTS_PER_THREAD;
+  static constexpr int ROWS_PER_BLOCK = 2;
+  static constexpr int WARP_SIZE = 32;
+  static constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK;
+  static constexpr int WARPS_PER_ROW = THREADS_PER_ROW / WARP_SIZE;
+  using VecType = PackedVec<T, ELTS_PER_THREAD>;
+  using FP4OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+
+  static_assert(THREADS_PER_SCALE == 1 || THREADS_PER_SCALE == 2);
+  static_assert(BLOCK_SIZE % ROWS_PER_BLOCK == 0);
+  static_assert(THREADS_PER_ROW % WARP_SIZE == 0);
+
+  __shared__ float rowWarpMax[ROWS_PER_BLOCK][WARPS_PER_ROW];
+  __shared__ float perTokenScaleShared[ROWS_PER_BLOCK];
+  __shared__ float inversePerTokenScaleShared[ROWS_PER_BLOCK];
+
+  uint32_t const numVecsPerRow = n / ELTS_PER_THREAD;
+  uint32_t const numSfVecsPerRow = n / SF_VEC_SIZE;
+  uint32_t const numRowTiles = (m + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+  auto const* inputVec = reinterpret_cast<VecType const*>(input);
+  auto* outputVec = reinterpret_cast<FP4OutT*>(weightOutput);
+  uint32_t const warpIdx = threadIdx.x / WARP_SIZE;
+  uint32_t const laneIdx = threadIdx.x % WARP_SIZE;
+  uint32_t const rowInBlock = warpIdx / WARPS_PER_ROW;
+  uint32_t const warpInRow = warpIdx % WARPS_PER_ROW;
+  uint32_t const threadInRow = warpInRow * WARP_SIZE + laneIdx;
+
+  for (uint32_t rowTileIdx = blockIdx.x; rowTileIdx < numRowTiles; rowTileIdx += gridDim.x) {
+    uint32_t const rowIdx = rowTileIdx * ROWS_PER_BLOCK + rowInBlock;
+    float localAmax = 0.f;
+    float cachedVecAmax0 = 0.f;
+    float cachedVecAmax1 = 0.f;
+    uint32_t const vecIdx0 = threadInRow;
+    uint32_t const vecIdx1 = threadInRow + THREADS_PER_ROW;
+    bool const useRegisterCachedPath = FULL_TILE || numVecsPerRow <= 2 * THREADS_PER_ROW;
+    bool hasVec0 = false;
+    bool hasVec1 = false;
+    VecType cachedVec0;
+    VecType cachedVec1;
+    if (rowIdx < m) {
+      if constexpr (FULL_TILE) {
+        int64_t const rowOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        loadPackedVec(cachedVec0, inputVec + rowOffset + vecIdx0);
+        loadPackedVec(cachedVec1, inputVec + rowOffset + vecIdx1);
+        cachedVecAmax0 = packedVecAmax(cachedVec0);
+        cachedVecAmax1 = packedVecAmax(cachedVec1);
+        localAmax = fmaxf(cachedVecAmax0, cachedVecAmax1);
+      } else if (useRegisterCachedPath) {
+        hasVec0 = vecIdx0 < numVecsPerRow;
+        hasVec1 = vecIdx1 < numVecsPerRow;
+        int64_t const rowOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        if (hasVec0) {
+          loadPackedVec(cachedVec0, inputVec + rowOffset + vecIdx0);
+          cachedVecAmax0 = packedVecAmax(cachedVec0);
+          localAmax = fmaxf(localAmax, cachedVecAmax0);
+        }
+        if (hasVec1) {
+          loadPackedVec(cachedVec1, inputVec + rowOffset + vecIdx1);
+          cachedVecAmax1 = packedVecAmax(cachedVec1);
+          localAmax = fmaxf(localAmax, cachedVecAmax1);
+        }
+      } else {
+        for (uint32_t vecIdx = threadInRow; vecIdx < numVecsPerRow; vecIdx += THREADS_PER_ROW) {
+          VecType vec;
+          loadPackedVec(vec, inputVec + static_cast<int64_t>(rowIdx) * numVecsPerRow + vecIdx);
+          localAmax = fmaxf(localAmax, packedVecAmax(vec));
+        }
+      }
+    }
+    float const warpAmax = warpReduceMax(localAmax);
+    if (laneIdx == 0) {
+      rowWarpMax[rowInBlock][warpInRow] = warpAmax;
+    }
+    __syncthreads();
+
+    if (warpInRow == 0) {
+      float rowAmax = laneIdx < WARPS_PER_ROW ? rowWarpMax[rowInBlock][laneIdx] : 0.f;
+      rowAmax = warpReduceMax(rowAmax);
+      if (laneIdx == 0 && rowIdx < m) {
+        perTokenScaleShared[rowInBlock] = rowAmax * globalScaleInv;
+        inversePerTokenScaleShared[rowInBlock] = perTokenScaleShared[rowInBlock] != 0.f
+            ? reciprocal_approximate_ftz(perTokenScaleShared[rowInBlock])
+            : 0.f;
+        perTokenScaleOutput[rowIdx] = perTokenScaleShared[rowInBlock];
+      }
+    }
+    __syncthreads();
+
+    if (rowIdx < m) {
+      float const perTokenScale = perTokenScaleShared[rowInBlock];
+      float const inversePerTokenScale = inversePerTokenScaleShared[rowInBlock];
+      if constexpr (FULL_TILE) {
+        int64_t const rowVecOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        int64_t const rowSfOffset = static_cast<int64_t>(rowIdx) * numSfVecsPerRow;
+        uint8_t fp8Scale0{0};
+        outputVec[rowVecOffset + vecIdx0] =
+            cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                cachedVec0, inversePerTokenScale, perTokenScale, cachedVecAmax0, &fp8Scale0);
+        scaleOutput[rowSfOffset + vecIdx0] = fp8Scale0;
+
+        uint8_t fp8Scale1{0};
+        outputVec[rowVecOffset + vecIdx1] =
+            cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                cachedVec1, inversePerTokenScale, perTokenScale, cachedVecAmax1, &fp8Scale1);
+        scaleOutput[rowSfOffset + vecIdx1] = fp8Scale1;
+      } else if (useRegisterCachedPath) {
+        int64_t const rowVecOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        int64_t const rowSfOffset = static_cast<int64_t>(rowIdx) * numSfVecsPerRow;
+        if (hasVec0) {
+          uint8_t fp8Scale{0};
+          outputVec[rowVecOffset + vecIdx0] =
+              cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                  cachedVec0, inversePerTokenScale, perTokenScale, cachedVecAmax0, &fp8Scale);
+          if constexpr (THREADS_PER_SCALE == 1) {
+            scaleOutput[rowSfOffset + vecIdx0] = fp8Scale;
+          } else if (threadInRow % THREADS_PER_SCALE == 0) {
+            scaleOutput[rowSfOffset + vecIdx0 / THREADS_PER_SCALE] = fp8Scale;
+          }
+        }
+        if (hasVec1) {
+          uint8_t fp8Scale{0};
+          outputVec[rowVecOffset + vecIdx1] =
+              cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                  cachedVec1, inversePerTokenScale, perTokenScale, cachedVecAmax1, &fp8Scale);
+          if constexpr (THREADS_PER_SCALE == 1) {
+            scaleOutput[rowSfOffset + vecIdx1] = fp8Scale;
+          } else if (threadInRow % THREADS_PER_SCALE == 0) {
+            scaleOutput[rowSfOffset + vecIdx1 / THREADS_PER_SCALE] = fp8Scale;
+          }
+        }
+      } else {
+        for (uint32_t vecIdx = threadInRow; vecIdx < numVecsPerRow; vecIdx += THREADS_PER_ROW) {
+          int64_t vecOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow + vecIdx;
+          VecType vec;
+          uint8_t fp8Scale{0};
+          loadPackedVec(vec, inputVec + vecOffset);
+          outputVec[vecOffset] = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+              vec, inversePerTokenScale, &fp8Scale);
+
+          if constexpr (THREADS_PER_SCALE == 1) {
+            scaleOutput[static_cast<int64_t>(rowIdx) * numSfVecsPerRow + vecIdx] = fp8Scale;
+          } else if (threadInRow % THREADS_PER_SCALE == 0) {
+            scaleOutput[static_cast<int64_t>(rowIdx) * numSfVecsPerRow +
+                        vecIdx / THREADS_PER_SCALE] = fp8Scale;
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <typename T, uint32_t BLOCK_SIZE, QuantizationSFLayout LAYOUT, bool FULL_TILE = false>
+__global__ void nvfp4QuantAndPerTokenScaleSwizzledKernel(
+    uint32_t m, uint32_t n, T const* __restrict__ input, float globalScaleInv,
+    uint8_t* __restrict__ weightOutput, uint8_t* __restrict__ scaleOutput,
+    float* __restrict__ perTokenScaleOutput) {
+  static_assert(LAYOUT == QuantizationSFLayout::SWIZZLED_128x4 ||
+                LAYOUT == QuantizationSFLayout::SWIZZLED_8x4);
+  static constexpr int ELTS_PER_THREAD = CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+  static constexpr int SF_VEC_SIZE = 16;
+  static constexpr int THREADS_PER_SCALE = SF_VEC_SIZE / ELTS_PER_THREAD;
+  static constexpr int ROWS_PER_BLOCK = 2;
+  static constexpr int WARP_SIZE = 32;
+  static constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK;
+  static constexpr int WARPS_PER_ROW = THREADS_PER_ROW / WARP_SIZE;
+  using VecType = PackedVec<T, ELTS_PER_THREAD>;
+  using FP4OutT = std::conditional_t<ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
+
+  static_assert(THREADS_PER_SCALE == 1 || THREADS_PER_SCALE == 2);
+  static_assert(BLOCK_SIZE % ROWS_PER_BLOCK == 0);
+  static_assert(THREADS_PER_ROW % WARP_SIZE == 0);
+
+  __shared__ float rowWarpMax[ROWS_PER_BLOCK][WARPS_PER_ROW];
+  __shared__ float perTokenScaleShared[ROWS_PER_BLOCK];
+  __shared__ float inversePerTokenScaleShared[ROWS_PER_BLOCK];
+  __shared__ int64_t rowSfBaseOffsetShared[ROWS_PER_BLOCK];
+
+  uint32_t const numVecsPerRow = n / ELTS_PER_THREAD;
+  uint32_t const numSfVecsPerRow = n / SF_VEC_SIZE;
+  uint32_t const numRowTiles = (m + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+  auto const* inputVec = reinterpret_cast<VecType const*>(input);
+  auto* outputVec = reinterpret_cast<FP4OutT*>(weightOutput);
+  uint32_t const warpIdx = threadIdx.x / WARP_SIZE;
+  uint32_t const laneIdx = threadIdx.x % WARP_SIZE;
+  uint32_t const rowInBlock = warpIdx / WARPS_PER_ROW;
+  uint32_t const warpInRow = warpIdx % WARPS_PER_ROW;
+  uint32_t const threadInRow = warpInRow * WARP_SIZE + laneIdx;
+
+  for (uint32_t rowTileIdx = blockIdx.x; rowTileIdx < numRowTiles; rowTileIdx += gridDim.x) {
+    uint32_t const rowIdx = rowTileIdx * ROWS_PER_BLOCK + rowInBlock;
+    float localAmax = 0.f;
+    float cachedVecAmax0 = 0.f;
+    float cachedVecAmax1 = 0.f;
+    uint32_t const vecIdx0 = threadInRow;
+    uint32_t const vecIdx1 = threadInRow + THREADS_PER_ROW;
+    bool const useRegisterCachedPath = FULL_TILE || numVecsPerRow <= 2 * THREADS_PER_ROW;
+    bool hasVec0 = false;
+    bool hasVec1 = false;
+    VecType cachedVec0;
+    VecType cachedVec1;
+    if (rowIdx < m) {
+      if constexpr (FULL_TILE) {
+        int64_t const rowOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        loadPackedVec(cachedVec0, inputVec + rowOffset + vecIdx0);
+        loadPackedVec(cachedVec1, inputVec + rowOffset + vecIdx1);
+        cachedVecAmax0 = packedVecAmax(cachedVec0);
+        cachedVecAmax1 = packedVecAmax(cachedVec1);
+        localAmax = fmaxf(cachedVecAmax0, cachedVecAmax1);
+      } else if (useRegisterCachedPath) {
+        hasVec0 = vecIdx0 < numVecsPerRow;
+        hasVec1 = vecIdx1 < numVecsPerRow;
+        int64_t const rowOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        if (hasVec0) {
+          loadPackedVec(cachedVec0, inputVec + rowOffset + vecIdx0);
+          cachedVecAmax0 = packedVecAmax(cachedVec0);
+          localAmax = fmaxf(localAmax, cachedVecAmax0);
+        }
+        if (hasVec1) {
+          loadPackedVec(cachedVec1, inputVec + rowOffset + vecIdx1);
+          cachedVecAmax1 = packedVecAmax(cachedVec1);
+          localAmax = fmaxf(localAmax, cachedVecAmax1);
+        }
+      } else {
+        for (uint32_t vecIdx = threadInRow; vecIdx < numVecsPerRow; vecIdx += THREADS_PER_ROW) {
+          VecType vec;
+          loadPackedVec(vec, inputVec + static_cast<int64_t>(rowIdx) * numVecsPerRow + vecIdx);
+          localAmax = fmaxf(localAmax, packedVecAmax(vec));
+        }
+      }
+    }
+    float const warpAmax = warpReduceMax(localAmax);
+    if (laneIdx == 0) {
+      rowWarpMax[rowInBlock][warpInRow] = warpAmax;
+    }
+    __syncthreads();
+
+    if (warpInRow == 0) {
+      float rowAmax = laneIdx < WARPS_PER_ROW ? rowWarpMax[rowInBlock][laneIdx] : 0.f;
+      rowAmax = warpReduceMax(rowAmax);
+      if (laneIdx == 0 && rowIdx < m) {
+        perTokenScaleShared[rowInBlock] = rowAmax * globalScaleInv;
+        inversePerTokenScaleShared[rowInBlock] = perTokenScaleShared[rowInBlock] != 0.f
+            ? reciprocal_approximate_ftz(perTokenScaleShared[rowInBlock])
+            : 0.f;
+        rowSfBaseOffsetShared[rowInBlock] =
+            getPerTokenSwizzledRowBaseOffset<LAYOUT>(rowIdx, numSfVecsPerRow);
+        perTokenScaleOutput[rowIdx] = perTokenScaleShared[rowInBlock];
+      }
+    }
+    __syncthreads();
+
+    if (rowIdx < m) {
+      float const perTokenScale = perTokenScaleShared[rowInBlock];
+      float const inversePerTokenScale = inversePerTokenScaleShared[rowInBlock];
+      int64_t const rowSfBaseOffset = rowSfBaseOffsetShared[rowInBlock];
+      if constexpr (FULL_TILE) {
+        int64_t const rowVecOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        uint8_t fp8Scale0{0};
+        outputVec[rowVecOffset + vecIdx0] =
+            cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                cachedVec0, inversePerTokenScale, perTokenScale, cachedVecAmax0, &fp8Scale0);
+        scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset, vecIdx0)] = fp8Scale0;
+
+        uint8_t fp8Scale1{0};
+        outputVec[rowVecOffset + vecIdx1] =
+            cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                cachedVec1, inversePerTokenScale, perTokenScale, cachedVecAmax1, &fp8Scale1);
+        scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset, vecIdx1)] = fp8Scale1;
+      } else if (useRegisterCachedPath) {
+        int64_t const rowVecOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow;
+        if (hasVec0) {
+          uint8_t fp8Scale{0};
+          outputVec[rowVecOffset + vecIdx0] =
+              cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                  cachedVec0, inversePerTokenScale, perTokenScale, cachedVecAmax0, &fp8Scale);
+          if constexpr (THREADS_PER_SCALE == 1) {
+            scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset, vecIdx0)] = fp8Scale;
+          } else if (threadInRow % THREADS_PER_SCALE == 0) {
+            scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset,
+                                                            vecIdx0 / THREADS_PER_SCALE)] = fp8Scale;
+          }
+        }
+        if (hasVec1) {
+          uint8_t fp8Scale{0};
+          outputVec[rowVecOffset + vecIdx1] =
+              cvt_warp_fp16_to_fp4_with_vec_max<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+                  cachedVec1, inversePerTokenScale, perTokenScale, cachedVecAmax1, &fp8Scale);
+          if constexpr (THREADS_PER_SCALE == 1) {
+            scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset, vecIdx1)] = fp8Scale;
+          } else if (threadInRow % THREADS_PER_SCALE == 0) {
+            scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset,
+                                                            vecIdx1 / THREADS_PER_SCALE)] = fp8Scale;
+          }
+        }
+      } else {
+        for (uint32_t vecIdx = threadInRow; vecIdx < numVecsPerRow; vecIdx += THREADS_PER_ROW) {
+          int64_t vecOffset = static_cast<int64_t>(rowIdx) * numVecsPerRow + vecIdx;
+          VecType vec;
+          uint8_t fp8Scale{0};
+          loadPackedVec(vec, inputVec + vecOffset);
+          outputVec[vecOffset] = cvt_warp_fp16_to_fp4<T, SF_VEC_SIZE, ELTS_PER_THREAD, false>(
+              vec, inversePerTokenScale, &fp8Scale);
+
+          if constexpr (THREADS_PER_SCALE == 1) {
+            scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset, vecIdx)] = fp8Scale;
+          } else if (threadInRow % THREADS_PER_SCALE == 0) {
+            scaleOutput[getPerTokenSwizzledSfOffset<LAYOUT>(rowSfBaseOffset,
+                                                            vecIdx / THREADS_PER_SCALE)] = fp8Scale;
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template <typename T, uint32_t BLOCK_SIZE>
 __global__ void nvfp4QuantAndPerTokenScaleKernel(
     // input
@@ -381,10 +748,64 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
 
   constexpr uint32_t BLOCK_SIZE = 256;
   dim3 block(BLOCK_SIZE);
-  dim3 grid(m);
-  nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE>
-      <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, expandedIdxToPermutedIdx,
-                                   weightOutput, scaleOutput, perTokenScaleOutput, sfLayout);
+  if (expandedIdxToPermutedIdx == nullptr && sfLayout == QuantizationSFLayout::LINEAR) {
+    int device = -1;
+    cudaGetDevice(&device);
+    int multiProcessorCount = 1;
+    cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+    int numBlocksPerSM = runtimeBlocksPerSM(static_cast<int>(block.x));
+    dim3 grid(std::min<uint32_t>((m + 1) / 2, multiProcessorCount * numBlocksPerSM));
+    constexpr uint32_t FULL_TILE_N = BLOCK_SIZE * CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+    if (n == FULL_TILE_N) {
+      nvfp4QuantAndPerTokenScaleLinearKernel<T, BLOCK_SIZE, true>
+          <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, weightOutput, scaleOutput,
+                                       perTokenScaleOutput);
+    } else {
+      nvfp4QuantAndPerTokenScaleLinearKernel<T, BLOCK_SIZE, false>
+          <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, weightOutput, scaleOutput,
+                                       perTokenScaleOutput);
+    }
+  } else if (expandedIdxToPermutedIdx == nullptr &&
+             (sfLayout == QuantizationSFLayout::SWIZZLED_128x4 ||
+              sfLayout == QuantizationSFLayout::SWIZZLED_8x4)) {
+    int device = -1;
+    cudaGetDevice(&device);
+    int multiProcessorCount = 1;
+    cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+    int numBlocksPerSM = runtimeBlocksPerSM(static_cast<int>(block.x));
+    dim3 grid(std::min<uint32_t>((m + 1) / 2, multiProcessorCount * numBlocksPerSM));
+    constexpr uint32_t FULL_TILE_N = BLOCK_SIZE * CVT_FP16_TO_FP4_ELTS_PER_THREAD;
+    if (sfLayout == QuantizationSFLayout::SWIZZLED_128x4) {
+      if (n == FULL_TILE_N) {
+        nvfp4QuantAndPerTokenScaleSwizzledKernel<
+            T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4, true>
+            <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, weightOutput, scaleOutput,
+                                         perTokenScaleOutput);
+      } else {
+        nvfp4QuantAndPerTokenScaleSwizzledKernel<
+            T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_128x4, false>
+            <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, weightOutput, scaleOutput,
+                                         perTokenScaleOutput);
+      }
+    } else {
+      if (n == FULL_TILE_N) {
+        nvfp4QuantAndPerTokenScaleSwizzledKernel<
+            T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4, true>
+            <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, weightOutput, scaleOutput,
+                                         perTokenScaleOutput);
+      } else {
+        nvfp4QuantAndPerTokenScaleSwizzledKernel<
+            T, BLOCK_SIZE, QuantizationSFLayout::SWIZZLED_8x4, false>
+            <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, weightOutput, scaleOutput,
+                                         perTokenScaleOutput);
+      }
+    }
+  } else {
+    dim3 grid(m);
+    nvfp4QuantAndPerTokenScaleKernel<T, BLOCK_SIZE>
+        <<<grid, block, 0, stream>>>(m, n, input, globalScaleInv, expandedIdxToPermutedIdx,
+                                     weightOutput, scaleOutput, perTokenScaleOutput, sfLayout);
+  }
 }
 
 // Instantiate the function.
@@ -537,8 +958,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     // Grid, Block size.
     // Each thread converts 16 values.
     dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
-    // Get number of blocks per SM (assume we can fully utilize the SM).
-    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+    int const numBlocksPerSM = runtimeBlocksPerSM(static_cast<int>(block.x));
     int effectiveRows = computeEffectiveRows(m, layout);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
@@ -600,10 +1020,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     }
     // Original non-TMA path for small m or SF_VEC_SIZE != 16
     // Grid, Block size.
-    // Each thread converts 8 values.
-    dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
-    // Get number of blocks per SM (assume we can fully utilize the SM).
-    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+    // Each thread converts 16 values on Blackwell and 8 values otherwise.
+    dim3 block(std::min(int(n / CVT_FP16_TO_FP4_ELTS_PER_THREAD), 512));
+    int const numBlocksPerSM = runtimeBlocksPerSM(static_cast<int>(block.x));
     int effectiveRows = computeEffectiveRows(m, layout);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
