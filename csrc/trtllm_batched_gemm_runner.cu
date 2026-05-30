@@ -112,6 +112,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         continue;
       }
 
+      // Skip cubins with clusterZ > 1 due to correctness issues described in
+      // https://github.com/flashinfer-ai/flashinfer/issues/3197
+      if (options.mClusterDimZ > 1) continue;
+
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
       }
