@@ -116,6 +116,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       // https://github.com/flashinfer-ai/flashinfer/issues/3197
       if (options.mClusterDimZ > 1) continue;
 
+      // Skip such kernel which may hang
+      if (options.mUseUnrollLoop2xForMma) continue;
+
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
       }
